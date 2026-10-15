@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<style>
+  :root {
+    --fg: #31333f;
+    --btn-bg: rgba(128,128,128,0.10);
+    --line: rgba(128,128,128,0.40);
+  }
+  html, body {
+    margin: 0; padding: 0; overflow: hidden; background: transparent;
+    color: var(--fg);
+    font-family: "Source Sans Pro", -apple-system, "Segoe UI", Roboto, sans-serif;
+    font-size: 14px;
+  }
+  #bar {
+    display: flex; align-items: center; gap: 8px; height: 40px;
+  }
+  #bar button {
+    font: inherit; font-weight: 600; color: var(--fg);
+    background: var(--btn-bg); border: 1px solid var(--line);
+    border-radius: 5px; padding: 4px 12px; cursor: pointer;
+  }
+  #bar button:hover { border-color: var(--fg); }
+  #zoomval { min-width: 52px; font-variant-numeric: tabular-nums; opacity: .75; }
+  #hint { margin-left: auto; font-size: 12px; opacity: .6; white-space: nowrap;
+          overflow: hidden; text-overflow: ellipsis; }
+  #panes { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .label {
+    height: 26px; line-height: 22px; font-size: 12px; font-weight: 650;
+    letter-spacing: .08em; text-transform: uppercase; opacity: .65;
+  }
+  canvas {
+    display: block; border: 1px solid var(--line); border-radius: 4px;
+    background: rgba(128,128,128,0.08); touch-action: none; cursor: grab;
+  }
+  #c1 { cursor: crosshair; }
+</style>
+</head>
+<body>
+  <div id="bar">
+    <button id="zin">Zoom +</button>
+    <button id="zout">Zoom &minus;</button>
+    <button id="zfit">Adatta</button>
+    <span id="zoomval">100%</span>
+    <span id="hint">Rotella: zoom &nbsp;|&nbsp; Trascina: sposta &nbsp;|&nbsp; Click sulla vista destra: rimuove la chiazza &nbsp;|&nbsp; Doppio click: reset</span>
+  </div>
+  <div id="panes">
+    <div><div class="label">Immagine originale</div><canvas id="c0"></canvas></div>
+    <div><div class="label">Chiazze rilevate</div><canvas id="c1"></canvas></div>
+  </div>
+
+<script>
+(function () {
+  const GAP = 16, BAR = 40, LABEL = 26, MAXH = 780, MAXZ = 40;
+  const $ = id => document.getElementById(id);
+  const c0 = $('c0'), c1 = $('c1');
+  const ctxs = [c0.getContext('2d'), c1.getContext('2d')];
+  const canv = [c0, c1];
+
+  let imgs = [null, null];
+  let ids = { orig: null, ov: null };
+  let dims = { w: 0, h: 0 };
+  let view = { zoom: 1, cx: 0, cy: 0 };
+  let cw = 300, ch = 300, dpr = 1;
+  let hover = null, pending = null, lastFrameH = 0;
+
+  // ---------- protocollo Streamlit ----------
+  function post(type, extra) {
+    window.parent.postMessage(Object.assign(
+      { isStreamlitMessage: true, type: 'streamlit:' + type }, extra || {}), '*');
+  }
+  function setHeight(h) {
+    if (h !== lastFrameH) { lastFrameH = h; post('setFrameHeight', { height: h }); }
+  }
+  function sendValue(v) {
+    post('setComponentValue', { value: v, dataType: 'json' });
+  }
+
+  // ---------- geometria ----------
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const fit = () => Math.min(cw / dims.w, ch / dims.h);
+  const scale = () => fit() * view.zoom;
+  function toImg(mx, my) {
+    const s = scale();
+    return { x: (mx - cw / 2) / s + view.cx, y: (my - ch / 2) / s + view.cy };
+  }
+  function clampView() {
+    view.zoom = clamp(view.zoom, 1, MAXZ);
+    if (view.zoom <= 1.0001) { view.cx = dims.w / 2; view.cy = dims.h / 2; return; }
+    view.cx = clamp(view.cx, 0, dims.w);
+    view.cy = clamp(view.cy, 0, dims.h);
+  }
+  function resetView() {
+    view = { zoom: 1, cx: dims.w / 2, cy: dims.h / 2 };
+    draw();
+  }
+
+  // ---------- disegno ----------
+  function drawPane(i) {
+    const ctx = ctxs[i], c = canv[i], img = imgs[i];
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, c.width, c.height);
+    if (!img || !dims.w) return;
+    const s = scale();
+    ctx.setTransform(dpr * s, 0, 0, dpr * s,
+                     dpr * (cw / 2 - view.cx * s), dpr * (ch / 2 - view.cy * s));
+    ctx.imageSmoothingEnabled = (s * dpr) < 3;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(img, 0, 0);
+
+    // elementi in coordinate schermo
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const sx = p => (p.x - view.cx) * s + cw / 2;
+    const sy = p => (p.y - view.cy) * s + ch / 2;
+    if (hover) {
+      ctx.lineWidth = 1.5; ctx.strokeStyle = 'rgba(255,212,0,0.95)';
+      ctx.beginPath(); ctx.arc(sx(hover), sy(hover), 7, 0, 2 * Math.PI); ctx.stroke();
+    }
+    if (pending && i === 1) {
+      ctx.lineWidth = 2; ctx.strokeStyle = 'rgba(0,200,255,0.95)';
+      ctx.beginPath(); ctx.arc(sx(pending), sy(pending), 10, 0, 2 * Math.PI); ctx.stroke();
+    }
+  }
+  function draw() {
+    drawPane(0); drawPane(1);
+    $('zoomval').textContent = Math.round(view.zoom * 100) + '%';
+  }
+
+  function layout() {
+    if (!dims.w) return;
+    dpr = window.devicePixelRatio || 1;
+    const total = document.documentElement.clientWidth;
+    cw = Math.floor((total - GAP) / 2) - 2;
+    ch = Math.max(240, Math.min(MAXH, Math.round(cw * dims.h / dims.w)));
+    for (const c of canv) {
+      c.style.width = cw + 'px'; c.style.height = ch + 'px';
+      c.width = Math.round(cw * dpr); c.height = Math.round(ch * dpr);
+    }
+    setHeight(BAR + LABEL + ch + 12);
+    clampView();
+    draw();
+  }
+
+  // ---------- interazione ----------
+  let drag = null;
+  function attach(c, isOv) {
+    c.addEventListener('pointerdown', e => {
+      if (e.button !== 0) return;
+      c.setPointerCapture(e.pointerId);
+      drag = { x: e.clientX, y: e.clientY, sx: e.clientX, sy: e.clientY, moved: false };
+    });
+    c.addEventListener('pointermove', e => {
+      const r = c.getBoundingClientRect();
+      const mx = e.clientX - r.left, my = e.clientY - r.top;
+      if (drag) {
+        if (!drag.moved && Math.hypot(e.clientX - drag.sx, e.clientY - drag.sy) > 4) {
+          drag.moved = true; c.style.cursor = 'grabbing';
+        }
+        if (drag.moved) {
+          const s = scale();
+          view.cx -= (e.clientX - drag.x) / s;
+          view.cy -= (e.clientY - drag.y) / s;
+          clampView();
+        }
+        drag.x = e.clientX; drag.y = e.clientY;
+      }
+      hover = toImg(mx, my);
+      draw();
+    });
+    c.addEventListener('pointerup', e => {
+      if (drag && !drag.moved && isOv) {
+        const r = c.getBoundingClientRect();
+        const p = toImg(e.clientX - r.left, e.clientY - r.top);
+        if (p.x >= 0 && p.y >= 0 && p.x < dims.w && p.y < dims.h) {
+          pending = p; draw();
+          sendValue({
+            fx: p.x / dims.w, fy: p.y / dims.h,
+            id: Date.now() + '-' + Math.random().toString(36).slice(2, 8)
+          });
+        }
+      }
+      drag = null;
+      c.style.cursor = isOv ? 'crosshair' : 'grab';
+    });
+    c.addEventListener('pointerleave', () => { if (!drag) { hover = null; draw(); } });
+    c.addEventListener('dblclick', resetView);
+    c.addEventListener('wheel', e => {
+      e.preventDefault();               // evita zoom/scroll della pagina
+      const r = c.getBoundingClientRect();
+      const mx = e.clientX - r.left, my = e.clientY - r.top;
+      const before = toImg(mx, my);
+      const dy = e.deltaMode === 1 ? e.deltaY * 33 : e.deltaY;
+      view.zoom = clamp(view.zoom * Math.exp(-dy * (e.ctrlKey ? 0.01 : 0.0016)), 1, MAXZ);
+      const s = scale();
+      view.cx = before.x - (mx - cw / 2) / s;
+      view.cy = before.y - (my - ch / 2) / s;
+      clampView();
+      draw();
+    }, { passive: false });
+  }
+  attach(c0, false);
+  attach(c1, true);
+
+  function zoomCenter(f) {
+    view.zoom = clamp(view.zoom * f, 1, MAXZ);
+    clampView(); draw();
+  }
+  $('zin').onclick = () => zoomCenter(1.5);
+  $('zout').onclick = () => zoomCenter(1 / 1.5);
+  $('zfit').onclick = resetView;
+  window.addEventListener('resize', layout);
+
+  // ---------- caricamento immagini ----------
+  function load(idx, src, done) {
+    const im = new Image();
+    im.onload = () => {
+      imgs[idx] = im;
+      if (idx === 0 || !dims.w) {
+        const changed = dims.w !== im.naturalWidth || dims.h !== im.naturalHeight;
+        dims = { w: im.naturalWidth, h: im.naturalHeight };
+        if (idx === 0 || changed) view = { zoom: 1, cx: dims.w / 2, cy: dims.h / 2 };
+      }
+      if (done) done();
+      layout();
+    };
+    im.src = src;
+  }
+
+  function applyTheme(t) {
+    if (!t) return;
+    const root = document.documentElement.style;
+    if (t.textColor) root.setProperty('--fg', t.textColor);
+  }
+
+  window.addEventListener('message', ev => {
+    const d = ev.data;
+    if (!d || d.type !== 'streamlit:render') return;
+    applyTheme(d.theme);
+    const a = d.args || {};
+    if (a.original_id !== ids.orig) {
+      ids.orig = a.original_id;
+      load(0, a.original);
+    }
+    if (a.overlay_id !== ids.ov) {
+      ids.ov = a.overlay_id;
+      load(1, a.overlay, () => { pending = null; });
+    }
+  });
+
+  post('componentReady', { apiVersion: 1 });
+  setHeight(500);
+})();
+</script>
+</body>
+</html>

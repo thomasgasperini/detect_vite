@@ -4,16 +4,20 @@ Rilevamento peronospora su foglia di vite - versione Streamlit.
   - Upload immagine (tif/png/jpg)
   - Due viste: originale | overlay con chiazze
   - Slider per i 3 parametri principali
-  - Click su overlay per rimuovere una chiazza (streamlit-image-coordinates)
+  - Click su overlay per rimuovere una chiazza
   - Annulla / Reset
   - Download overlay, maschera, CSV
   - Guida integrata
 
 Richiede: numpy scipy scikit-image opencv-python-headless pillow
-          streamlit streamlit-image-coordinates pandas
+          streamlit pandas
+Cartella necessaria accanto a questo file: vite_viewer/index.html
 """
 import io
+import os
 import csv
+import hashlib
+import base64
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -21,7 +25,7 @@ import cv2
 from PIL import Image
 from scipy import ndimage as ndi
 from skimage import measure, segmentation
-from streamlit_image_coordinates import streamlit_image_coordinates
+import streamlit.components.v1 as components
 
 # ------------------------- rilevamento (invariato) -------------------------
 FIXED = {'vein_r': 8, 'tight_W': 0.84, 'split': 15}
@@ -149,9 +153,15 @@ RIEPILOGO SLIDER
 """
 
 # --------------------------------- UI --------------------------------------
+MAX_DISP = 2000   # lato massimo (px) delle immagini inviate al visualizzatore
+
 st.set_page_config(page_title="Detect Vite - Peronospora",
                    layout="wide",
                    initial_sidebar_state="expanded")
+
+_viewer = components.declare_component(
+    "vite_viewer",
+    path=os.path.join(os.path.dirname(os.path.abspath(__file__)), "vite_viewer"))
 
 STYLE = """
 <style>
@@ -252,11 +262,56 @@ def section_title(text):
                 unsafe_allow_html=True)
 
 
+# ------------------------- funzioni con cache ------------------------------
+def _data_url(arr, quality=90):
+    b = io.BytesIO()
+    Image.fromarray(arr).save(b, format='JPEG', quality=quality)
+    return "data:image/jpeg;base64," + base64.b64encode(b.getvalue()).decode()
+
+
+@st.cache_resource(max_entries=2, show_spinner="Caricamento immagine...")
+def load_bundle(img_key, _data):
+    """Decodifica e preparazione: eseguite una sola volta per immagine."""
+    arr = np.array(Image.open(io.BytesIO(_data)).convert('RGB'))
+    leaf, inside, W, V = prepara(arr.astype(np.float32))
+    H, W_img = arr.shape[:2]
+    sc = min(1.0, MAX_DISP / max(H, W_img))
+    if sc < 1.0:
+        disp = cv2.resize(arr, (int(W_img * sc), int(H * sc)),
+                          interpolation=cv2.INTER_AREA)
+    else:
+        disp = arr
+    return {'arr': arr, 'leaf': leaf, 'inside': inside, 'W': W, 'V': V,
+            'disp': disp, 'orig_url': _data_url(disp)}
+
+
+@st.cache_resource(max_entries=12, show_spinner="Analisi in corso...")
+def cached_detect(img_key, seed_W, dens, area_min, _b):
+    params = {'seed_W': seed_W, 'dens': dens, 'area_min': area_min, **FIXED}
+    return detect(params, _b['leaf'], _b['inside'], _b['W'], _b['V'])
+
+
+def make_overlay(base, seg):
+    ov = base.copy()
+    edge = segmentation.find_boundaries(seg, mode='outer')
+    ov[seg > 0] = (0.55 * ov[seg > 0] + 0.45 * np.array([255, 0, 0])).astype(np.uint8)
+    ov[edge] = (255, 0, 0)
+    return ov
+
+
+def png_bytes(arr):
+    b = io.BytesIO()
+    Image.fromarray(arr).save(b, format='PNG', compress_level=1)
+    return b.getvalue()
+
+
 # stato
 if "removed" not in st.session_state:
     st.session_state.removed = []
 if "file_id" not in st.session_state:
     st.session_state.file_id = None
+if "export" not in st.session_state:
+    st.session_state.export = None
 
 # intestazione
 st.markdown(
@@ -313,54 +368,64 @@ if file is None:
 if st.session_state.file_id != file.name:
     st.session_state.file_id = file.name
     st.session_state.removed = []
+    st.session_state.export = None
 
-img = Image.open(file).convert('RGB')
-a = np.array(img).astype(np.float32)
+data = file.getvalue()
+img_key = hashlib.md5(data).hexdigest()
+bundle = load_bundle(img_key, data)
+img_arr = bundle['arr']
+leaf = bundle['leaf']
+H, W_img = img_arr.shape[:2]
+disp_h, disp_w = bundle['disp'].shape[:2]
 
-# cache preparazione (dipende solo dall'immagine)
-@st.cache_data(show_spinner=False)
-def cached_prepara(img_bytes):
-    arr = np.array(Image.open(io.BytesIO(img_bytes)).convert('RGB')).astype(np.float32)
-    return prepara(arr)
+seg_raw = cached_detect(img_key, seed_W, dens, area_min, bundle)
 
-buf = io.BytesIO()
-img.save(buf, format='PNG')
-leaf, inside, W, V = cached_prepara(buf.getvalue())
 
-params = {'seed_W': seed_W, 'dens': dens, 'area_min': area_min, **FIXED}
-seg_raw = detect(params, leaf, inside, W, V)
+def apply_removals(seg_raw, removed):
+    seg = seg_raw.copy()
+    for x, y in removed:
+        if 0 <= y < seg.shape[0] and 0 <= x < seg.shape[1]:
+            lab = seg[y, x]
+            if lab:
+                seg[seg == lab] = 0
+    return seg
 
-# applica rimozioni
-seg = seg_raw.copy()
-for x, y in st.session_state.removed:
-    if 0 <= y < seg.shape[0] and 0 <= x < seg.shape[1]:
-        lab = seg[y, x]
-        if lab:
+
+seg = apply_removals(seg_raw, st.session_state.removed)
+
+# ----------------------- gestione click sul visualizzatore -----------------
+VIEW_KEY = f"viewer_{img_key}"
+LAST_KEY = f"last_click_{img_key}"
+
+
+def handle_click(val, seg):
+    """Rimuove la chiazza cliccata. Ritorna True se lo stato e' cambiato."""
+    if not val or val.get("id") == st.session_state.get(LAST_KEY):
+        return False
+    st.session_state[LAST_KEY] = val.get("id")
+    x = min(max(int(val["fx"] * W_img), 0), W_img - 1)
+    y = min(max(int(val["fy"] * H), 0), H - 1)
+    # raggio di tolleranza per agganciare la chiazza più vicina
+    r = max(2, int(5 * W_img / disp_w))
+    y0, y1 = max(0, y - r), min(H, y + r + 1)
+    x0, x1 = max(0, x - r), min(W_img, x + r + 1)
+    lab = seg[y, x] or seg[y0:y1, x0:x1].max()
+    if lab:
+        yy, xx = np.nonzero(seg == lab)
+        i = np.argmin((xx - x) ** 2 + (yy - y) ** 2)
+        pos = (int(xx[i]), int(yy[i]))
+        if pos not in st.session_state.removed:
+            st.session_state.removed.append(pos)
             seg[seg == lab] = 0
+            return True
+    return False
 
-# overlay
-ov = np.array(img).copy()
-edge = segmentation.find_boundaries(seg, mode='outer')
-ov[seg > 0] = (0.55 * ov[seg > 0] + 0.45 * np.array([255, 0, 0])).astype(np.uint8)
-ov[edge] = (255, 0, 0)
 
-# metriche
-leaf_px = leaf.sum() or 1
-n = int(seg.max())
-cop = 100 * (seg > 0).sum() / leaf_px
+# il click e' gia' nello stato del widget all'inizio dell'esecuzione:
+# viene applicato prima di calcolare overlay e metriche (una sola esecuzione)
+handle_click(st.session_state.get(VIEW_KEY), seg)
 
-H, W_img = ov.shape[:2]
-st.caption(f"File: {file.name}   |   Dimensioni: {W_img} x {H} px")
-
-section_title("Sintesi dell'analisi")
-c1, c2, c3 = st.columns(3)
-c1.metric("Chiazze rilevate", n)
-c2.metric("Copertura foglia", f"{cop:.2f} %")
-c3.metric("Rimozioni manuali", len(st.session_state.removed))
-
-st.write("")
-
-# CSV
+# ------------------------------- metriche ----------------------------------
 k = (px_mm ** 2) if px_mm > 0 else 1
 unit = 'mm2' if px_mm > 0 else 'px'
 rows = []
@@ -375,43 +440,41 @@ for i, r in enumerate(measure.regionprops(seg), 1):
     })
 df = pd.DataFrame(rows)
 
-def png_bytes(arr):
-    b = io.BytesIO()
-    Image.fromarray(arr).save(b, format='PNG')
-    return b.getvalue()
+leaf_px = leaf.sum() or 1
+n = len(rows)
+cop = 100 * (seg > 0).sum() / leaf_px
+
+st.caption(f"File: {file.name}   |   Dimensioni: {W_img} x {H} px")
+
+section_title("Sintesi dell'analisi")
+c1, c2, c3 = st.columns(3)
+c1.metric("Chiazze rilevate", n)
+c2.metric("Copertura foglia", f"{cop:.2f} %")
+c3.metric("Rimozioni manuali", len(st.session_state.removed))
+
+st.write("")
+
+# overlay per la visualizzazione (a risoluzione ridotta: molto più veloce)
+if (disp_w, disp_h) != (W_img, H):
+    seg_d = cv2.resize(seg, (disp_w, disp_h), interpolation=cv2.INTER_NEAREST)
+else:
+    seg_d = seg
+ov_d = make_overlay(bundle['disp'], seg_d)
+overlay_id = hashlib.md5(repr((img_key, seed_W, dens, area_min,
+                               tuple(st.session_state.removed))).encode()
+                         ).hexdigest()[:12]
 
 # --------------------------------- tab -------------------------------------
 tab_an, tab_dati, tab_exp, tab_guida = st.tabs(
     ["Analisi", "Dettaglio chiazze", "Esportazione", "Guida"])
 
 with tab_an:
-    col1, col2 = st.columns(2, gap="large")
-    with col1:
-        section_title("Immagine originale")
-        st.image(img, use_container_width=True)
-    with col2:
-        section_title("Chiazze rilevate - clicca per rimuovere")
-
-        # ridimensiona per il widget click (max 900 px lato)
-        scale = min(1.0, 900 / max(H, W_img))
-        disp = cv2.resize(ov, (int(W_img * scale), int(H * scale)),
-                          interpolation=cv2.INTER_AREA)
-        coords = streamlit_image_coordinates(disp, key=f"click_{st.session_state.file_id}_{len(st.session_state.removed)}")
-        if coords is not None:
-            x = int(coords["x"] / scale)
-            y = int(coords["y"] / scale)
-            # raggio di tolleranza per agganciare la chiazza più vicina
-            r = max(2, int(5 / scale))
-            y0, y1 = max(0, y - r), min(H, y + r + 1)
-            x0, x1 = max(0, x - r), min(W_img, x + r + 1)
-            lab = seg[y, x] or seg[y0:y1, x0:x1].max()
-            if lab:
-                yy, xx = np.nonzero(seg == lab)
-                i = np.argmin((xx - x) ** 2 + (yy - y) ** 2)
-                pos = (int(xx[i]), int(yy[i]))
-                if pos not in st.session_state.removed:
-                    st.session_state.removed.append(pos)
-                    st.rerun()
+    res = _viewer(original=bundle['orig_url'], overlay=_data_url(ov_d),
+                  original_id=img_key, overlay_id=overlay_id,
+                  key=VIEW_KEY, default=None)
+    # sicurezza: se il click non era ancora nello stato, applicalo e ridisegna
+    if handle_click(res, seg):
+        st.rerun()
 
 with tab_dati:
     section_title("Tabella delle chiazze")
@@ -422,27 +485,40 @@ with tab_dati:
 
 with tab_exp:
     section_title("File di output")
-    d1, d2, d3 = st.columns(3, gap="medium")
-    with d1:
-        with st.container(border=True):
-            st.markdown("**Overlay**")
-            st.caption("Immagine con le chiazze evidenziate (PNG).")
-            st.download_button("Scarica overlay", png_bytes(ov),
-                               file_name="overlay.png", mime="image/png")
-    with d2:
-        with st.container(border=True):
-            st.markdown("**Maschera**")
-            st.caption("Maschera binaria delle chiazze (PNG).")
-            st.download_button("Scarica maschera",
-                               png_bytes(((seg > 0) * 255).astype(np.uint8)),
-                               file_name="maschera.png", mime="image/png")
-    with d3:
-        with st.container(border=True):
-            st.markdown("**Dati**")
-            st.caption("Area, centroide e bounding box di ogni chiazza (CSV).")
-            csv_str = df.to_csv(index=False)
-            st.download_button("Scarica CSV", csv_str,
-                               file_name="chiazze.csv", mime="text/csv")
+    sig = (img_key, seed_W, dens, area_min, px_mm,
+           tuple(st.session_state.removed))
+    if st.button("Genera / aggiorna file di esportazione"):
+        ov_full = make_overlay(img_arr, seg)
+        st.session_state.export = {
+            'sig': sig,
+            'overlay': png_bytes(ov_full),
+            'mask': png_bytes(((seg > 0) * 255).astype(np.uint8)),
+            'csv': df.to_csv(index=False),
+        }
+    ex = st.session_state.export
+    if ex is None or ex['sig'] != sig:
+        st.info("I file non sono aggiornati: premi il pulsante sopra per "
+                "generarli con i parametri e le rimozioni correnti.")
+    else:
+        d1, d2, d3 = st.columns(3, gap="medium")
+        with d1:
+            with st.container(border=True):
+                st.markdown("**Overlay**")
+                st.caption("Immagine con le chiazze evidenziate (PNG).")
+                st.download_button("Scarica overlay", ex['overlay'],
+                                   file_name="overlay.png", mime="image/png")
+        with d2:
+            with st.container(border=True):
+                st.markdown("**Maschera**")
+                st.caption("Maschera binaria delle chiazze (PNG).")
+                st.download_button("Scarica maschera", ex['mask'],
+                                   file_name="maschera.png", mime="image/png")
+        with d3:
+            with st.container(border=True):
+                st.markdown("**Dati**")
+                st.caption("Area, centroide e bounding box di ogni chiazza (CSV).")
+                st.download_button("Scarica CSV", ex['csv'],
+                                   file_name="chiazze.csv", mime="text/csv")
 
 with tab_guida:
     section_title("Guida al rilevamento")
