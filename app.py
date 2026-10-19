@@ -198,36 +198,232 @@ foglia occupata dal fungo (la linea verde chiaro è il perimetro della foglia).
 **5. Esporta** overlay, maschera e CSV dalla scheda *Esportazione*.
 """
 
-GUIDA_ALGO = """\
-FASE 0 - PREPARAZIONE
-- maschera "foglia": pixel non neri, riempimento buchi, rimozione rumore
-- maschera "interno": foglia erosa di 12 px (toglie il bordo chiaro)
-- mappa W = min(R,B)/(G+1)  ->  ~1 se bianco, ~0 se verde
-- mappa V = luminosità media, sfocata
+GUIDA_PANORAMICA = """\
+L'app non usa reti neurali: applica una catena di **operazioni classiche di
+elaborazione d'immagine** che sfrutta tre fatti: lo sfondo è nero, la foglia è
+verde e la peronospora forma **macchie biancastre** (R, G e B simili e alti).
 
-FASE 1 - GRANULI CANDIDATI  [SLIDER 1]
-Pixel con W > soglia, V > 135, dentro "interno". Scarta gruppi < 7 px.
+```
+immagine RGB
+   │
+   ├─ 0  Preparazione ─ maschera foglia, maschera interna, mappe W e V
+   ├─ 1  Pixel candidati (soglia su W e V)             ◄ slider "Bianchezza"
+   ├─ 2  Eliminazione nervature (forma + apertura)
+   ├─ 3  Raggruppamento (densità locale)               ◄ slider "Densità"
+   ├─ 4  Contorno preciso (soglia + chiusura)
+   ├─ 5  Filtro area minima                            ◄ slider "Area minima"
+   ├─ 6  Separazione chiazze unite (watershed)
+   ├─ 7  Correzioni manuali (rimozione / poligoni)
+   └─ 8  Copertura % = pixel fungo / pixel foglia × 100
+```
 
-FASE 2 - NERVATURE (fissa)
-Forme lunghe e sottili (eccentricità > 0.97) rimosse con apertura r=8.
+Quasi tutte le fasi lavorano su **maschere binarie** (immagini con pixel 0/1:
+"è foglia / non è foglia", "è fungo / non è fungo"). Le operazioni usate
+vengono spiegate nel glossario in fondo.
+"""
 
-FASE 3 - RAGGRUPPAMENTO  [SLIDER 2]
-Densità locale in finestra 41x41. Sopra soglia -> candidato chiazza.
+GUIDA_FASI = [
+    ("Fase 0 · Preparazione: maschere e mappe di colore", r"""
+Eseguita **una sola volta** per immagine, a risoluzione piena.
 
-FASE 4 - CONTORNO (fissa)
-W > 0.84 + chiusura r=4 per aderire al bianco vero.
+**Maschera "foglia"**
+1. Si tiene ogni pixel in cui il canale più luminoso supera 25
+   (`max(R,G,B) > 25`): tutto ciò che non è nero.
+2. Si eliminano le **componenti connesse** (gruppi di pixel adiacenti, anche in
+   diagonale) più piccole di 5000 px: polvere, rumore del sensore, riflessi.
+3. Si **riempiono i buchi** interni: un'area scura dentro la foglia (per
+   esempio un foro) resta comunque foglia.
 
-FASE 5 - AREA MINIMA  [SLIDER 3]
-Scarta componenti sotto la soglia.
+È la maschera su cui si calcola il denominatore della copertura e da cui si
+traccia la **linea verde chiaro** del perimetro.
 
-FASE 6 - WATERSHED (fissa)
-Distance transform + massimi locali + watershed per separare chiazze unite
-(serve solo a poter escludere le chiazze una per una).
+**Maschera "interno"**
+La maschera foglia viene **erosa** con un elemento 3×3 ripetuto 12 volte,
+cioè ridotta di circa 12 px su tutto il bordo. Il margine della foglia è spesso
+più chiaro (riflessi, bordo secco) e verrebbe scambiato per fungo: escluderlo
+a monte evita molti falsi positivi.
 
-RIEPILOGO SLIDER
-1) Bianchezza: alto = meno falsi positivi
-2) Densità:    alto = servono grumi fitti
-3) Area:       alto = via le macchiette
+**Mappa di bianchezza W**
+
+$$W = \frac{\min(R,\,B)}{G + 1}$$
+
+- su un pixel **bianco** R ≈ G ≈ B, quindi W ≈ 1;
+- su un pixel **verde** G è molto maggiore di R e B, quindi W resta basso
+  (tipicamente 0.3–0.6);
+- usare il *minimo* tra R e B impedisce che pixel gialli o violetti risultino
+  "bianchi";
+- il +1 evita la divisione per zero.
+
+La mappa viene poi sfocata con un **filtro gaussiano** (σ = 1 px) per
+attenuare il rumore pixel per pixel.
+
+**Mappa di luminosità V**
+Media dei tre canali, anch'essa sfocata (σ = 1). Serve a distinguere il bianco
+(chiaro) dal grigio o dall'ombra (scuro) quando W da solo non basta.
+"""),
+    ("Fase 1 · Pixel candidati  [slider: Bianchezza minima]", r"""
+Una **sogliatura** (thresholding) a tre condizioni:
+
+```
+candidato = (W > soglia_bianchezza)  e  (V > 135)  e  dentro "interno"
+```
+
+Poi si scartano i gruppi di meno di 7 px (granelli isolati).
+
+Il risultato sono i **granelli bianchi**: non ancora chiazze, solo i punti che
+hanno il colore giusto.
+
+- **Alzando** la soglia (0.88 → 0.92) restano solo i pixel molto bianchi:
+  meno falsi positivi, ma si perdono le macchie più sbiadite.
+- **Abbassandola** si includono anche zone verdastre o grigie.
+"""),
+    ("Fase 2 · Eliminazione delle nervature", r"""
+Le nervature della foglia sono chiare e possono superare la soglia di W.
+Si riconoscono dalla **forma**: sono lunghe e sottili.
+
+1. I granelli vengono **etichettati** (ogni componente connessa riceve un
+   numero).
+2. Per ogni componente con area > 150 px si calcola la **matrice di
+   covarianza** delle coordinate (x, y) dei suoi pixel e i suoi due autovalori
+   λ₁ ≥ λ₂. Questi misurano l'allungamento della forma lungo i due assi.
+3. Si ricava l'**eccentricità**:
+
+$$e = \sqrt{1 - \frac{\lambda_2}{\lambda_1}}$$
+
+   - cerchio → e ≈ 0
+   - linea molto sottile → e ≈ 1
+4. Le componenti con **e > 0.97** sono considerate nervature.
+5. Su queste si applica una **apertura morfologica** con elemento ellittico di
+   raggio 8 px: elimina le strutture più strette di circa 17 px e conserva i
+   blob più larghi. Una nervatura sparisce; una chiazza che la attraversa
+   rimane.
+
+La maschera finale dei candidati è: *(candidati non allungati) ∪ (parti
+spesse delle forme allungate)*, di nuovo ripulita dai gruppi < 7 px.
+"""),
+    ("Fase 3 · Raggruppamento per densità  [slider: Densità minima]", r"""
+Una macchia vera è un **grumo fitto** di granelli bianchi; i falsi positivi
+sono granelli sparsi. Per misurarlo:
+
+1. Si calcola la **densità locale** con un filtro a media (*box filter*) su una
+   finestra 41 × 41 px: in ogni punto, la **frazione** di pixel candidati
+   nell'intorno (valore tra 0 e 1).
+2. Si tiene dove la densità supera la soglia e si è dentro "interno".
+3. **Apertura** (raggio 5) per tagliare filamenti e ponti sottili.
+4. Si scartano le zone < 500 px e si **riempiono i buchi**.
+
+Il risultato è una **zona candidata**: un'area generosa che contiene la
+chiazza, ma con un bordo ancora approssimativo (la finestra 41 × 41 sfoca i
+confini).
+
+- **Alzando** la densità servono grumi più compatti.
+- **Abbassandola** anche i granelli poco raggruppati formano zone.
+"""),
+    ("Fase 4 e 5 · Contorno preciso e area minima  [slider: Area minima]", r"""
+Per far aderire il bordo al bianco reale si interseca la zona candidata con
+una soglia **più severa**:
+
+```
+stretta = zona_candidata  e  (W > 0.84)  e  (V > 120)
+```
+
+Poi una **chiusura morfologica** (raggio 4) richiude i piccoli buchi dentro le
+macchie, e infine si scartano le componenti con area inferiore alla soglia
+scelta nello slider.
+
+- **Alzando** l'area minima spariscono le macchioline.
+- **Abbassandola** si tengono anche i punti piccoli.
+
+Questa è la **maschera del fungo** prima delle correzioni manuali.
+"""),
+    ("Fase 6 · Separazione delle chiazze unite (watershed)", r"""
+Chiazze vicine possono risultare fuse in un'unica componente. Per poterle
+escludere una per una si separano così:
+
+1. **Trasformata di distanza** (distance transform): ogni pixel della maschera
+   prende il valore della distanza dal bordo più vicino. Il centro di una
+   chiazza tonda è un "picco".
+2. Si cercano i **massimi locali** della distanza in una finestra di 31 × 31
+   px (e distanza ≥ 5): ogni massimo diventa un **seme**, uno per chiazza.
+3. **Watershed** (spartiacque): l'immagine delle distanze è vista come un
+   rilievo e "riempita d'acqua" a partire dai semi; dove le acque di due semi
+   si incontrano si traccia il confine.
+4. Fuori dalla maschera le etichette sono azzerate.
+
+Questa fase **non cambia la copertura totale**: serve solo a dare un'identità
+a ogni chiazza, così lo strumento *Rimuovi chiazza* esclude solo quella
+cliccata.
+"""),
+    ("Fase 7 · Correzioni manuali", r"""
+Le correzioni vengono **riapplicate in ordine** alla segmentazione grezza ogni
+volta che qualcosa cambia (per questo *Annulla* funziona in modo affidabile).
+
+- **Rimuovi chiazza**: il clic viene convertito nelle coordinate dell'immagine
+  originale e si cerca il pixel di fungo più vicino entro una piccola
+  tolleranza; tutta l'etichetta a cui appartiene viene azzerata.
+- **Aggiungi zona**: i vertici sono salvati come coordinate **normalizzate**
+  (0–1), quindi indipendenti dalla risoluzione di visualizzazione. Il
+  poligono è **rasterizzato** a risoluzione piena (riempimento scanline),
+  **intersecato con la maschera foglia** (non si può contare fungo fuori dalla
+  foglia) e aggiunto come nuova etichetta, sovrascrivendo ciò che c'era sotto.
+- Si può rimuovere anche una zona disegnata: i clic di rimozione sono
+  applicati dopo le aggiunte precedenti.
+"""),
+    ("Fase 8 · Calcolo della copertura e visualizzazione", r"""
+**Copertura**
+
+$$\text{copertura}\,[\%] = 100 \times \frac{\#\text{pixel con fungo}}{\#\text{pixel della foglia}}$$
+
+Il denominatore è l'**intera** maschera foglia (non quella erosa). Con una
+calibrazione di *mm per pixel* le aree sono moltiplicate per (mm/px)².
+
+**Overlay**
+- le zone con fungo sono **miscelate in rosso** (55 % immagine + 45 % rosso)
+  con un contorno rosso pieno, ricavato dai **bordi** tra etichette;
+- il **perimetro della foglia** è il contorno esterno della maschera foglia
+  (*find contours*, solo le curve esterne), disegnato in verde chiaro con
+  **anti-aliasing**.
+
+**Prestazioni**
+Il rilevamento gira a risoluzione piena e viene messo in **cache**: cambiare
+una correzione non lo ripete. Al visualizzatore invece viene inviata
+un'immagine ridotta a un massimo di 2000 px per lato, per restare fluidi;
+l'esportazione usa invece la risoluzione originale.
+"""),
+]
+
+GUIDA_GLOSSARIO = r"""
+| Termine | Che cosa fa |
+|---|---|
+| **Sogliatura** | Trasforma una mappa in una maschera 0/1: 1 dove il valore supera una soglia. |
+| **Componente connessa** | Gruppo di pixel a 1 adiacenti (anche in diagonale). Si può contare, misurare o eliminare. |
+| **Erosione** | Restringe le forme di un certo raggio; elimina i dettagli sottili. |
+| **Dilatazione** | Allarga le forme di un certo raggio. |
+| **Apertura** | Erosione + dilatazione: elimina rumore e strutture sottili senza ridurre le forme grandi. |
+| **Chiusura** | Dilatazione + erosione: chiude piccoli buchi e fessure. |
+| **Filtro gaussiano** | Sfocatura pesata; riduce il rumore. σ è l'ampiezza in pixel. |
+| **Box filter** | Media su una finestra quadrata; qui misura la densità locale. |
+| **Autovalori / eccentricità** | Descrivono quanto una forma è allungata. |
+| **Trasformata di distanza** | Ogni pixel prende la distanza dal bordo più vicino. |
+| **Watershed** | Segmentazione "a spartiacque": separa oggetti uniti a partire da semi. |
+| **Rasterizzazione** | Conversione di un poligono in pixel pieni. |
+"""
+
+GUIDA_CONSIGLI = """\
+| Problema | Cosa provare |
+|---|---|
+| Troppe zone rosse sul verde sano | Alza **Bianchezza** (es. 0.90) o **Densità** |
+| Macchie evidenti non rilevate | Abbassa **Bianchezza** o **Densità** |
+| Tante macchioline sparse | Alza **Area minima** |
+| Macchie piccole ma vere escluse | Abbassa **Area minima** |
+| Nervature segnate come fungo | Alza **Densità**; in alternativa escludile con *Rimuovi chiazza* |
+| Fungo non rilevato in una zona precisa | Disegnala con *Aggiungi zona* |
+| Il bordo della foglia risulta rosso | Normale se il bordo è molto chiaro: escludilo con *Rimuovi chiazza* |
+
+**Condizioni di ripresa consigliate:** sfondo nero uniforme, foglia ben
+distesa, luce diffusa senza riflessi speculari, stessa distanza e stessa
+illuminazione tra le foto che vuoi confrontare (le soglie dipendono dal
+colore).
 """
 
 # --------------------------------- UI --------------------------------------
@@ -390,7 +586,7 @@ with st.sidebar:
 if file is None:
     st.markdown(
         """
-        _____________________________________________________________________________
+        #### Per iniziare
         1. **Carica una foto** della foglia dalla barra laterale (TIF, PNG o JPG).
         2. **Regola i parametri** finché le zone rosse coprono le macchie bianche.
         3. **Correggi a mano** dove serve: escludi chiazze o disegna zone da
@@ -563,5 +759,21 @@ with tab_guida:
     section_title("Come si usa")
     with st.container(border=True):
         st.markdown(GUIDA_USO)
-    with st.expander("Come funziona l'algoritmo di rilevamento"):
-        st.text(GUIDA_ALGO)
+
+    st.write("")
+    section_title("Processo di elaborazione dell'immagine")
+    with st.container(border=True):
+        st.markdown(GUIDA_PANORAMICA)
+    for titolo, testo in GUIDA_FASI:
+        with st.expander(titolo):
+            st.markdown(testo)
+
+    st.write("")
+    section_title("Consigli per la messa a punto")
+    with st.container(border=True):
+        st.markdown(GUIDA_CONSIGLI)
+
+    st.write("")
+    section_title("Glossario delle operazioni")
+    with st.container(border=True):
+        st.markdown(GUIDA_GLOSSARIO)
