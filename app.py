@@ -390,7 +390,6 @@ with st.sidebar:
 if file is None:
     st.markdown(
         """
-        #### Per iniziare
         1. **Carica una foto** della foglia dalla barra laterale (TIF, PNG o JPG).
         2. **Regola i parametri** finché le zone rosse coprono le macchie bianche.
         3. **Correggi a mano** dove serve: escludi chiazze o disegna zone da
