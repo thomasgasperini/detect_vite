@@ -2,12 +2,15 @@
 Rilevamento peronospora su foglia di vite - versione Streamlit.
 
   - Upload immagine (tif/png/jpg)
-  - Due viste: originale | overlay con chiazze
+  - Due viste: originale | rilevamento (con perimetro della foglia)
   - Slider per i 3 parametri principali
-  - Click su overlay per rimuovere una chiazza
-  - Annulla / Reset
-  - Download overlay, maschera, CSV
-  - Guida integrata
+  - Correzione manuale:
+      * clic su una chiazza -> la esclude
+      * poligono (clic sinistro = vertici, clic destro = chiudi) -> aggiunge
+        una zona da considerare come fungo
+  - Annulla / Reset (il Reset ripristina anche gli slider)
+  - Risultato: copertura percentuale della foglia
+  - Download overlay, maschera, CSV riassuntivo
 
 Richiede: numpy scipy scikit-image opencv-python-headless pillow
           streamlit pandas
@@ -15,7 +18,6 @@ Cartella necessaria accanto a questo file: vite_viewer/index.html
 """
 import io
 import os
-import csv
 import hashlib
 import base64
 import numpy as np
@@ -24,11 +26,18 @@ import streamlit as st
 import cv2
 from PIL import Image
 from scipy import ndimage as ndi
-from skimage import measure, segmentation
+from skimage import segmentation
 import streamlit.components.v1 as components
 
 # ------------------------- rilevamento (invariato) -------------------------
 FIXED = {'vein_r': 8, 'tight_W': 0.84, 'split': 15}
+
+# valori predefiniti degli slider (usati anche dal pulsante Reset)
+DEFAULTS = {'seed_W': 0.88, 'dens': 0.14, 'area_min': 200}
+
+RED = np.array([255, 0, 0])
+LEAF_EDGE = (144, 238, 144)      # verde chiaro
+
 
 def rm_small(mask, n):
     lab, nlab = ndi.label(mask, structure=np.ones((3, 3), int))
@@ -39,9 +48,11 @@ def rm_small(mask, n):
     keep[0] = False
     return keep[lab]
 
+
 def morph(mask, r, op):
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
     return cv2.morphologyEx(mask.astype(np.uint8), op, k) > 0
+
 
 def prepara(a):
     R, G, B = a[..., 0], a[..., 1], a[..., 2]
@@ -52,6 +63,7 @@ def prepara(a):
                          (0, 0), 1)
     V = cv2.GaussianBlur(a.mean(2).astype(np.float32), (0, 0), 1)
     return leaf, inside, W, V
+
 
 def detect(p, leaf, inside, W, V):
     seed = rm_small((W > p['seed_W']) & (V > 135) & inside, 7)
@@ -111,17 +123,82 @@ def detect(p, leaf, inside, W, V):
     labels[~tight] = 0
     return labels.astype(np.int32)
 
+
+# ------------------------- correzioni e overlay ----------------------------
+def apply_actions(seg_raw, actions, leaf):
+    """Riapplica in ordine le correzioni manuali alla segmentazione grezza.
+
+    actions: lista di dict
+      {'t': 'rm',  'pos': (x, y)}          -> elimina la chiazza in (x, y)
+      {'t': 'add', 'pts': [[fx, fy], ...]} -> aggiunge un poligono (coord. 0-1)
+    """
+    seg = seg_raw.copy()
+    H, W = seg.shape
+    nxt = int(seg.max()) + 1
+    for a in actions:
+        if a['t'] == 'rm':
+            x, y = a['pos']
+            lab = seg[y, x]
+            if lab:
+                seg[seg == lab] = 0
+        else:
+            pts = np.array([[round(px * (W - 1)), round(py * (H - 1))]
+                            for px, py in a['pts']], np.int32)
+            m = np.zeros((H, W), np.uint8)
+            cv2.fillPoly(m, [pts], 1)
+            m = (m > 0) & leaf
+            if m.any():
+                seg[m] = nxt
+                nxt += 1
+    return seg
+
+
+def leaf_contours(mask):
+    cs, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL,
+                             cv2.CHAIN_APPROX_SIMPLE)
+    return [c for c in cs if len(c) > 20]
+
+
+def make_overlay(base, seg, contours=None, thick=2):
+    ov = np.ascontiguousarray(base.copy())
+    m = seg > 0
+    ov[m] = (0.55 * ov[m] + 0.45 * RED).astype(np.uint8)
+    edge = segmentation.find_boundaries(seg, mode='outer')
+    ov[edge] = RED
+    if contours:
+        cv2.drawContours(ov, contours, -1, LEAF_EDGE, thick, cv2.LINE_AA)
+    return ov
+
+
+def png_bytes(arr):
+    b = io.BytesIO()
+    Image.fromarray(arr).save(b, format='PNG', compress_level=1)
+    return b.getvalue()
+
+
 # ------------------------------- guida -------------------------------------
-GUIDA = """\
-COME FUNZIONA IL RILEVAMENTO DELLA PERONOSPORA
-==============================================
+GUIDA_USO = """\
+**1. Carica l'immagine** dalla barra laterale (TIF, PNG o JPG).
 
-IN DUE PAROLE
-La peronospora forma MACCHIE BIANCHE sulla foglia. L'algoritmo sfrutta:
-  - foglia VERDE
-  - chiazze BIANCHE
-  - sfondo NERO
+**2. Regola i parametri** finché le zone rosse coprono bene le macchie bianche.
+Il tasto **Reset** riporta gli slider ai valori predefiniti.
 
+**3. Correggi a mano** dalla barra strumenti sopra l'immagine:
+
+- **Rimuovi chiazza**: clicca su una zona rossa per escluderla.
+- **Aggiungi zona**: clicca per segnare i vertici di un poligono; con il
+  **tasto destro** (o *Invio*) il poligono si chiude e l'area viene contata
+  come fungo. *Esc* annulla il disegno, *Backspace* toglie l'ultimo vertice.
+- **Naviga**: trascina per spostare l'immagine, rotellina per lo zoom. In ogni
+  modalità puoi spostare l'immagine trascinando.
+
+**4. Leggi la copertura** nelle schede in alto: è la percentuale di area della
+foglia occupata dal fungo (la linea verde chiaro è il perimetro della foglia).
+
+**5. Esporta** overlay, maschera e CSV dalla scheda *Esportazione*.
+"""
+
+GUIDA_ALGO = """\
 FASE 0 - PREPARAZIONE
 - maschera "foglia": pixel non neri, riempimento buchi, rimozione rumore
 - maschera "interno": foglia erosa di 12 px (toglie il bordo chiaro)
@@ -144,7 +221,8 @@ FASE 5 - AREA MINIMA  [SLIDER 3]
 Scarta componenti sotto la soglia.
 
 FASE 6 - WATERSHED (fissa)
-Distance transform + massimi locali + watershed per separare chiazze unite.
+Distance transform + massimi locali + watershed per separare chiazze unite
+(serve solo a poter escludere le chiazze una per una).
 
 RIEPILOGO SLIDER
 1) Bianchezza: alto = meno falsi positivi
@@ -165,91 +243,43 @@ _viewer = components.declare_component(
 
 STYLE = """
 <style>
-    /* Contenitore principale */
-    .block-container {
-        padding-top: 2.2rem;
-        padding-bottom: 3rem;
-        max-width: 1500px;
-    }
+    .block-container { padding-top: 2rem; padding-bottom: 2.5rem; max-width: 1600px; }
 
-    /* Intestazione */
-    .app-header {
-        border-bottom: 1px solid rgba(128, 128, 128, 0.35);
-        padding-bottom: 0.9rem;
-        margin-bottom: 1.4rem;
-    }
-    .app-header h1 {
-        font-size: 1.65rem;
-        font-weight: 650;
-        letter-spacing: -0.01em;
-        margin: 0;
-        padding: 0;
-    }
-    .app-header p {
-        margin: 0.25rem 0 0 0;
-        font-size: 0.92rem;
-        opacity: 0.7;
-    }
+    .app-header { border-bottom: 1px solid rgba(128,128,128,.35);
+                  padding-bottom: .8rem; margin-bottom: 1.1rem; }
+    .app-header h1 { font-size: 1.6rem; font-weight: 650; letter-spacing: -.01em;
+                     margin: 0; padding: 0; }
+    .app-header p { margin: .25rem 0 0 0; font-size: .92rem; opacity: .7; }
 
-    /* Titoli di sezione */
-    .section-title {
-        font-size: 0.78rem;
-        font-weight: 650;
-        letter-spacing: 0.08em;
-        text-transform: uppercase;
-        opacity: 0.65;
-        margin: 0 0 0.6rem 0;
-    }
+    .section-title { font-size: .76rem; font-weight: 650; letter-spacing: .08em;
+                     text-transform: uppercase; opacity: .65; margin: 0 0 .5rem 0; }
 
-    /* Sidebar */
-    section[data-testid="stSidebar"] .block-container {
-        padding-top: 1.6rem;
-    }
-    section[data-testid="stSidebar"] h2 {
-        font-size: 1.05rem;
-        font-weight: 650;
-    }
+    /* sidebar */
+    section[data-testid="stSidebar"] .block-container { padding-top: 1.4rem; }
+    section[data-testid="stSidebar"] .section-title { margin-top: .4rem; }
+    section[data-testid="stSidebar"] hr { margin: 1rem 0; }
 
-    /* Metriche */
-    div[data-testid="stMetric"] {
-        background: rgba(128, 128, 128, 0.07);
-        border: 1px solid rgba(128, 128, 128, 0.25);
-        border-radius: 6px;
-        padding: 0.9rem 1.1rem;
-    }
-    div[data-testid="stMetricLabel"] p {
-        font-size: 0.78rem;
-        font-weight: 600;
-        letter-spacing: 0.04em;
-        text-transform: uppercase;
-        opacity: 0.7;
-    }
-    div[data-testid="stMetricValue"] {
-        font-size: 1.7rem;
-        font-weight: 650;
-    }
+    /* metriche */
+    div[data-testid="stMetric"] { background: rgba(128,128,128,.07);
+        border: 1px solid rgba(128,128,128,.25); border-radius: 8px;
+        padding: .8rem 1.1rem; }
+    div[data-testid="stMetricLabel"] p { font-size: .76rem; font-weight: 600;
+        letter-spacing: .04em; text-transform: uppercase; opacity: .7; }
+    div[data-testid="stMetricValue"] { font-size: 1.7rem; font-weight: 650; }
+    .hero div[data-testid="stMetric"] { border-color: #ff4b4b;
+        background: rgba(255,75,75,.08); }
+    .hero div[data-testid="stMetricValue"] { font-size: 2.2rem; }
 
-    /* Tab */
-    button[data-baseweb="tab"] {
-        font-weight: 600;
-        padding-left: 1.1rem;
-        padding-right: 1.1rem;
-    }
+    button[data-baseweb="tab"] { font-weight: 600; padding-left: 1.1rem;
+                                 padding-right: 1.1rem; }
+    .stButton > button, .stDownloadButton > button { border-radius: 6px;
+        font-weight: 550; width: 100%; }
 
-    /* Pulsanti */
-    .stButton > button, .stDownloadButton > button {
-        border-radius: 5px;
-        font-weight: 550;
-        width: 100%;
-    }
+    .legend { display: flex; gap: 1.4rem; flex-wrap: wrap; font-size: .85rem;
+              opacity: .8; margin-top: .5rem; }
+    .legend i { display: inline-block; width: 22px; height: 0; vertical-align: middle;
+                margin-right: 6px; border-top: 3px solid; }
 
-    /* Immagini */
-    div[data-testid="stImage"] img {
-        border-radius: 4px;
-        border: 1px solid rgba(128, 128, 128, 0.25);
-    }
-
-    /* Elementi di default da nascondere */
     footer {visibility: hidden;}
     #MainMenu {visibility: hidden;}
 </style>
@@ -279,10 +309,14 @@ def load_bundle(img_key, _data):
     if sc < 1.0:
         disp = cv2.resize(arr, (int(W_img * sc), int(H * sc)),
                           interpolation=cv2.INTER_AREA)
+        leaf_d = cv2.resize(leaf.astype(np.uint8),
+                            (disp.shape[1], disp.shape[0]),
+                            interpolation=cv2.INTER_NEAREST)
     else:
-        disp = arr
+        disp, leaf_d = arr, leaf
     return {'arr': arr, 'leaf': leaf, 'inside': inside, 'W': W, 'V': V,
-            'disp': disp, 'orig_url': _data_url(disp)}
+            'disp': disp, 'orig_url': _data_url(disp),
+            'leaf_cnt_disp': leaf_contours(leaf_d)}
 
 
 @st.cache_resource(max_entries=12, show_spinner="Analisi in corso...")
@@ -291,29 +325,29 @@ def cached_detect(img_key, seed_W, dens, area_min, _b):
     return detect(params, _b['leaf'], _b['inside'], _b['W'], _b['V'])
 
 
-def make_overlay(base, seg):
-    ov = base.copy()
-    edge = segmentation.find_boundaries(seg, mode='outer')
-    ov[seg > 0] = (0.55 * ov[seg > 0] + 0.45 * np.array([255, 0, 0])).astype(np.uint8)
-    ov[edge] = (255, 0, 0)
-    return ov
-
-
-def png_bytes(arr):
-    b = io.BytesIO()
-    Image.fromarray(arr).save(b, format='PNG', compress_level=1)
-    return b.getvalue()
-
-
-# stato
-if "removed" not in st.session_state:
-    st.session_state.removed = []
+# ------------------------------- stato -------------------------------------
+if "actions" not in st.session_state:
+    st.session_state.actions = []
 if "file_id" not in st.session_state:
     st.session_state.file_id = None
 if "export" not in st.session_state:
     st.session_state.export = None
 
-# intestazione
+
+def reset_all():
+    """Riporta slider ai valori predefiniti e cancella le correzioni."""
+    for k, v in DEFAULTS.items():
+        st.session_state[k] = v
+    st.session_state.actions = []
+    st.session_state.export = None
+
+
+def undo_last():
+    if st.session_state.actions:
+        st.session_state.actions.pop()
+
+
+# ------------------------------- intestazione ------------------------------
 st.markdown(
     """
     <div class="app-header">
@@ -326,52 +360,69 @@ st.markdown(
 
 # ------------------------------- sidebar -----------------------------------
 with st.sidebar:
-    st.header("Parametri di rilevamento")
-    st.caption("Le modifiche vengono applicate immediatamente all'analisi.")
+    section_title("1 · Immagine")
+    file = st.file_uploader("Immagine foglia",
+                            type=['tif', 'tiff', 'png', 'jpg', 'jpeg'],
+                            label_visibility="collapsed")
 
-    seed_W = st.slider("Bianchezza minima del pixel",
-                       0.80, 0.95, 0.88, 0.005,
+    st.divider()
+    section_title("2 · Parametri di rilevamento")
+    seed_W = st.slider("Bianchezza minima", 0.80, 0.95, DEFAULTS['seed_W'],
+                       0.005, key="seed_W",
                        help="Valori alti riducono i falsi positivi.")
-    dens = st.slider("Densità minima di pixel bianchi vicini",
-                     0.05, 0.30, 0.14, 0.01,
+    dens = st.slider("Densità minima di pixel bianchi vicini", 0.05, 0.30,
+                     DEFAULTS['dens'], 0.01, key="dens",
                      help="Valori alti richiedono grumi più fitti.")
-    area_min = st.slider("Area minima di una chiazza (px)",
-                         100, 3000, 200, 50,
+    area_min = st.slider("Area minima di una chiazza (px)", 100, 3000,
+                         DEFAULTS['area_min'], 50, key="area_min",
                          help="Valori alti eliminano le macchie più piccole.")
 
     st.divider()
-    st.subheader("Calibrazione")
-    px_mm = st.number_input("mm per pixel (0 = misure in px)",
-                            min_value=0.0, value=0.0, step=0.01)
+    section_title("3 · Correzione manuale")
+    st.caption("Usa gli strumenti sopra l'immagine: *Rimuovi chiazza* "
+               "per escludere, *Aggiungi zona* per disegnare un poligono "
+               "(clic destro per chiuderlo).")
+    corr_info = st.empty()
+    b1, b2 = st.columns(2)
+    b1.button("Annulla", on_click=undo_last,
+              help="Annulla l'ultima correzione manuale.")
+    b2.button("Reset", on_click=reset_all,
+              help="Ripristina i parametri predefiniti e cancella tutte "
+                   "le correzioni manuali.")
 
     st.divider()
-    st.subheader("Correzione manuale")
-    st.caption("Clicca su una chiazza nella vista di destra per escluderla.")
-    b1, b2 = st.columns(2)
-    if b1.button("Annulla"):
-        if st.session_state.get("removed"):
-            st.session_state.removed.pop()
-    if b2.button("Reset"):
-        st.session_state.removed = []
+    section_title("Visualizzazione")
+    show_perim = st.checkbox("Mostra perimetro della foglia", value=True,
+                             key="show_perim")
+
+    with st.expander("Calibrazione (opzionale)"):
+        px_mm = st.number_input("mm per pixel (0 = misure in px)",
+                                min_value=0.0, value=0.0, step=0.01,
+                                key="px_mm")
 
 # ------------------------------- caricamento -------------------------------
-section_title("Immagine di input")
-file = st.file_uploader("Immagine foglia",
-                        type=['tif', 'tiff', 'png', 'jpg', 'jpeg'],
-                        label_visibility="collapsed")
-
 if file is None:
-    st.info("Carica un'immagine (TIF, PNG o JPG) per avviare l'analisi.")
+    st.markdown(
+        """
+        #### Per iniziare
+        1. **Carica una foto** della foglia dalla barra laterale (TIF, PNG o JPG).
+        2. **Regola i parametri** finché le zone rosse coprono le macchie bianche.
+        3. **Correggi a mano** dove serve: escludi chiazze o disegna zone da
+           considerare come fungo.
+        4. **Leggi la copertura percentuale** ed esporta i risultati.
+        """
+    )
     st.stop()
-
-# reset rimozioni se cambia file
-if st.session_state.file_id != file.name:
-    st.session_state.file_id = file.name
-    st.session_state.removed = []
-    st.session_state.export = None
 
 data = file.getvalue()
 img_key = hashlib.md5(data).hexdigest()
+
+# nuova immagine -> azzera le correzioni
+if st.session_state.file_id != img_key:
+    st.session_state.file_id = img_key
+    st.session_state.actions = []
+    st.session_state.export = None
+
 bundle = load_bundle(img_key, data)
 img_arr = bundle['arr']
 leaf = bundle['leaf']
@@ -379,78 +430,70 @@ H, W_img = img_arr.shape[:2]
 disp_h, disp_w = bundle['disp'].shape[:2]
 
 seg_raw = cached_detect(img_key, seed_W, dens, area_min, bundle)
+seg = apply_actions(seg_raw, st.session_state.actions, leaf)
 
-
-def apply_removals(seg_raw, removed):
-    seg = seg_raw.copy()
-    for x, y in removed:
-        if 0 <= y < seg.shape[0] and 0 <= x < seg.shape[1]:
-            lab = seg[y, x]
-            if lab:
-                seg[seg == lab] = 0
-    return seg
-
-
-seg = apply_removals(seg_raw, st.session_state.removed)
-
-# ----------------------- gestione click sul visualizzatore -----------------
+# ----------------------- gestione eventi dal visualizzatore ----------------
 VIEW_KEY = f"viewer_{img_key}"
-LAST_KEY = f"last_click_{img_key}"
+LAST_KEY = f"last_event_{img_key}"
 
 
-def handle_click(val, seg):
-    """Rimuove la chiazza cliccata. Ritorna True se lo stato e' cambiato."""
+def handle_event(val, seg):
+    """Applica un evento del visualizzatore. True se lo stato e' cambiato."""
     if not val or val.get("id") == st.session_state.get(LAST_KEY):
         return False
     st.session_state[LAST_KEY] = val.get("id")
+
+    if val.get("type") == "poly":
+        pts = [[min(max(float(x), 0.0), 1.0), min(max(float(y), 0.0), 1.0)]
+               for x, y in val.get("pts", [])]
+        if len(pts) >= 3:
+            st.session_state.actions.append({'t': 'add', 'pts': pts})
+            return True
+        return False
+
+    # rimozione chiazza
     x = min(max(int(val["fx"] * W_img), 0), W_img - 1)
     y = min(max(int(val["fy"] * H), 0), H - 1)
-    # raggio di tolleranza per agganciare la chiazza più vicina
-    r = max(2, int(5 * W_img / disp_w))
+    r = max(2, int(5 * W_img / disp_w))          # tolleranza di aggancio
     y0, y1 = max(0, y - r), min(H, y + r + 1)
     x0, x1 = max(0, x - r), min(W_img, x + r + 1)
-    lab = seg[y, x] or seg[y0:y1, x0:x1].max()
-    if lab:
-        yy, xx = np.nonzero(seg == lab)
-        i = np.argmin((xx - x) ** 2 + (yy - y) ** 2)
-        pos = (int(xx[i]), int(yy[i]))
-        if pos not in st.session_state.removed:
-            st.session_state.removed.append(pos)
-            seg[seg == lab] = 0
-            return True
-    return False
+    win = seg[y0:y1, x0:x1]
+    yy, xx = np.nonzero(win)
+    if len(yy) == 0:
+        return False
+    i = np.argmin((yy + y0 - y) ** 2 + (xx + x0 - x) ** 2)
+    pos = (int(xx[i] + x0), int(yy[i] + y0))
+    st.session_state.actions.append({'t': 'rm', 'pos': pos})
+    return True
 
 
-# il click e' gia' nello stato del widget all'inizio dell'esecuzione:
-# viene applicato prima di calcolare overlay e metriche (una sola esecuzione)
-handle_click(st.session_state.get(VIEW_KEY), seg)
+# il click e' gia' nello stato del widget all'inizio dell'esecuzione
+if handle_event(st.session_state.get(VIEW_KEY), seg):
+    seg = apply_actions(seg_raw, st.session_state.actions, leaf)
+
+n_add = sum(a['t'] == 'add' for a in st.session_state.actions)
+n_rm = sum(a['t'] == 'rm' for a in st.session_state.actions)
+corr_info.caption(f"Correzioni: **{n_add}** zone aggiunte · "
+                  f"**{n_rm}** chiazze escluse")
 
 # ------------------------------- metriche ----------------------------------
 k = (px_mm ** 2) if px_mm > 0 else 1
-unit = 'mm2' if px_mm > 0 else 'px'
-rows = []
-for i, r in enumerate(measure.regionprops(seg), 1):
-    rows.append({
-        'id': i,
-        f'area_{unit}': round(r.area * k, 3),
-        'x_centroide_px': round(r.centroid[1]),
-        'y_centroide_px': round(r.centroid[0]),
-        'bbox_riga_min': r.bbox[0], 'bbox_col_min': r.bbox[1],
-        'bbox_riga_max': r.bbox[2], 'bbox_col_max': r.bbox[3],
-    })
-df = pd.DataFrame(rows)
+unit = 'mm²' if px_mm > 0 else 'px'
+fmt = (lambda v: f"{v:,.1f}") if px_mm > 0 else (lambda v: f"{int(v):,}")
 
-leaf_px = leaf.sum() or 1
-n = len(rows)
-cop = 100 * (seg > 0).sum() / leaf_px
+leaf_px = int(leaf.sum()) or 1
+fung_px = int((seg > 0).sum())
+cop = 100 * fung_px / leaf_px
 
-st.caption(f"File: {file.name}   |   Dimensioni: {W_img} x {H} px")
+st.caption(f"File: {file.name}   |   Dimensioni: {W_img} × {H} px")
 
-section_title("Sintesi dell'analisi")
-c1, c2, c3 = st.columns(3)
-c1.metric("Chiazze rilevate", n)
-c2.metric("Copertura foglia", f"{cop:.2f} %")
-c3.metric("Rimozioni manuali", len(st.session_state.removed))
+c1, c2, c3 = st.columns([1.3, 1, 1])
+with c1:
+    st.markdown('<div class="hero">', unsafe_allow_html=True)
+    st.metric("Copertura della foglia", f"{cop:.2f} %")
+    st.markdown('</div>', unsafe_allow_html=True)
+c2.metric("Area interessata", f"{fmt(fung_px * k)} {unit}")
+c3.metric("Area foglia", f"{fmt(leaf_px * k)} {unit}")
 
 st.write("")
 
@@ -459,68 +502,83 @@ if (disp_w, disp_h) != (W_img, H):
     seg_d = cv2.resize(seg, (disp_w, disp_h), interpolation=cv2.INTER_NEAREST)
 else:
     seg_d = seg
-ov_d = make_overlay(bundle['disp'], seg_d)
-overlay_id = hashlib.md5(repr((img_key, seed_W, dens, area_min,
-                               tuple(st.session_state.removed))).encode()
+ov_d = make_overlay(bundle['disp'], seg_d,
+                    bundle['leaf_cnt_disp'] if show_perim else None, thick=2)
+overlay_id = hashlib.md5(repr((img_key, seed_W, dens, area_min, show_perim,
+                               st.session_state.actions)).encode()
                          ).hexdigest()[:12]
 
 # --------------------------------- tab -------------------------------------
-tab_an, tab_dati, tab_exp, tab_guida = st.tabs(
-    ["Analisi", "Dettaglio chiazze", "Esportazione", "Guida"])
+tab_an, tab_exp, tab_guida = st.tabs(["Analisi", "Esportazione", "Guida"])
 
 with tab_an:
     res = _viewer(original=bundle['orig_url'], overlay=_data_url(ov_d),
                   original_id=img_key, overlay_id=overlay_id,
-                  key=VIEW_KEY, default=None)
+                  height=740, key=VIEW_KEY, default=None)
+    st.markdown(
+        '<div class="legend">'
+        '<span><i style="border-color:#ff4b4b"></i>Zone considerate fungo</span>'
+        '<span><i style="border-color:#90ee90"></i>Perimetro della foglia</span>'
+        '</div>', unsafe_allow_html=True)
     # sicurezza: se il click non era ancora nello stato, applicalo e ridisegna
-    if handle_click(res, seg):
+    if handle_event(res, seg):
         st.rerun()
-
-with tab_dati:
-    section_title("Tabella delle chiazze")
-    if df.empty:
-        st.info("Nessuna chiazza rilevata con i parametri correnti.")
-    else:
-        st.dataframe(df, use_container_width=True, hide_index=True)
 
 with tab_exp:
     section_title("File di output")
-    sig = (img_key, seed_W, dens, area_min, px_mm,
-           tuple(st.session_state.removed))
+    sig = (img_key, seed_W, dens, area_min, px_mm, show_perim,
+           repr(st.session_state.actions))
     if st.button("Genera / aggiorna file di esportazione"):
-        ov_full = make_overlay(img_arr, seg)
+        thick = max(2, int(max(H, W_img) / 600))
+        ov_full = make_overlay(img_arr, seg,
+                               leaf_contours(leaf) if show_perim else None,
+                               thick)
+        summary = pd.DataFrame([{
+            'file': file.name,
+            f'area_foglia_{unit}': round(leaf_px * k, 3),
+            f'area_interessata_{unit}': round(fung_px * k, 3),
+            'copertura_percentuale': round(cop, 3),
+            'bianchezza_min': seed_W,
+            'densita_min': dens,
+            'area_min_chiazza_px': area_min,
+            'mm_per_pixel': px_mm,
+            'zone_aggiunte': n_add,
+            'chiazze_escluse': n_rm,
+        }])
         st.session_state.export = {
             'sig': sig,
             'overlay': png_bytes(ov_full),
             'mask': png_bytes(((seg > 0) * 255).astype(np.uint8)),
-            'csv': df.to_csv(index=False),
+            'csv': summary.to_csv(index=False),
         }
     ex = st.session_state.export
     if ex is None or ex['sig'] != sig:
         st.info("I file non sono aggiornati: premi il pulsante sopra per "
-                "generarli con i parametri e le rimozioni correnti.")
+                "generarli con i parametri e le correzioni correnti.")
     else:
         d1, d2, d3 = st.columns(3, gap="medium")
         with d1:
             with st.container(border=True):
                 st.markdown("**Overlay**")
-                st.caption("Immagine con le chiazze evidenziate (PNG).")
+                st.caption("Immagine con zone e perimetro evidenziati (PNG).")
                 st.download_button("Scarica overlay", ex['overlay'],
                                    file_name="overlay.png", mime="image/png")
         with d2:
             with st.container(border=True):
                 st.markdown("**Maschera**")
-                st.caption("Maschera binaria delle chiazze (PNG).")
+                st.caption("Maschera binaria delle zone con fungo (PNG).")
                 st.download_button("Scarica maschera", ex['mask'],
                                    file_name="maschera.png", mime="image/png")
         with d3:
             with st.container(border=True):
-                st.markdown("**Dati**")
-                st.caption("Area, centroide e bounding box di ogni chiazza (CSV).")
+                st.markdown("**Riepilogo**")
+                st.caption("Copertura percentuale, aree e parametri (CSV).")
                 st.download_button("Scarica CSV", ex['csv'],
-                                   file_name="chiazze.csv", mime="text/csv")
+                                   file_name="copertura.csv", mime="text/csv")
 
 with tab_guida:
-    section_title("Guida al rilevamento")
+    section_title("Come si usa")
     with st.container(border=True):
-        st.text(GUIDA)
+        st.markdown(GUIDA_USO)
+    with st.expander("Come funziona l'algoritmo di rilevamento"):
+        st.text(GUIDA_ALGO)

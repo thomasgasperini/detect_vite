@@ -2,256 +2,390 @@
 <html lang="it">
 <head>
 <meta charset="utf-8">
+<title>Vite viewer</title>
 <style>
   :root {
-    --fg: #31333f;
-    --btn-bg: rgba(128,128,128,0.10);
-    --line: rgba(128,128,128,0.40);
+    --bg: #ffffff; --fg: #262730; --sec: #f0f2f6; --primary: #ff4b4b;
+    --border: rgba(128,128,128,.38);
   }
+  * { box-sizing: border-box; }
   html, body {
-    margin: 0; padding: 0; overflow: hidden; background: transparent;
+    margin: 0; height: 100%; overflow: hidden; background: transparent;
     color: var(--fg);
-    font-family: "Source Sans Pro", -apple-system, "Segoe UI", Roboto, sans-serif;
+    font-family: "Source Sans Pro", system-ui, -apple-system, "Segoe UI", sans-serif;
     font-size: 14px;
   }
-  #bar {
-    display: flex; align-items: center; gap: 8px; height: 40px;
+  #app { display: flex; flex-direction: column; height: 100%; gap: 8px; }
+
+  /* barra strumenti */
+  #bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 20px; }
+  .grp { display: flex; align-items: center; gap: 8px; }
+  .grp[hidden] { display: none; }
+  .spacer { flex: 1; }
+  .lbl { font-size: 11px; font-weight: 650; letter-spacing: .07em;
+         text-transform: uppercase; opacity: .6; }
+  .seg { display: inline-flex; border: 1px solid var(--border);
+         border-radius: 6px; overflow: hidden; }
+  button {
+    font: inherit; font-weight: 550; color: var(--fg); background: var(--sec);
+    border: 0; padding: 6px 12px; cursor: pointer;
   }
-  #bar button {
-    font: inherit; font-weight: 600; color: var(--fg);
-    background: var(--btn-bg); border: 1px solid var(--line);
-    border-radius: 5px; padding: 4px 12px; cursor: pointer;
+  .seg button + button { border-left: 1px solid var(--border); }
+  button:hover { filter: brightness(.94); }
+  button.on { background: var(--primary); color: #fff; }
+  button.solo { border: 1px solid var(--border); border-radius: 6px; }
+  #zlbl { min-width: 44px; opacity: .7; font-variant-numeric: tabular-nums; }
+
+  /* pannelli immagine */
+  #panes { flex: 1; display: flex; gap: 8px; min-height: 0; }
+  .pane {
+    position: relative; flex: 1; min-width: 0; overflow: hidden;
+    background: #151515; border: 1px solid var(--border); border-radius: 6px;
+    touch-action: none;
   }
-  #bar button:hover { border-color: var(--fg); }
-  #zoomval { min-width: 52px; font-variant-numeric: tabular-nums; opacity: .75; }
-  #hint { margin-left: auto; font-size: 12px; opacity: .6; white-space: nowrap;
-          overflow: hidden; text-overflow: ellipsis; }
-  #panes { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-  .label {
-    height: 26px; line-height: 22px; font-size: 12px; font-weight: 650;
-    letter-spacing: .08em; text-transform: uppercase; opacity: .65;
+  .pane.hide { display: none; }
+  .pane.pan { cursor: grab; }
+  .pane.pan.drag { cursor: grabbing; }
+  .pane.remove { cursor: pointer; }
+  .pane.poly { cursor: crosshair; }
+  .tag {
+    position: absolute; top: 8px; left: 8px; z-index: 2; pointer-events: none;
+    background: rgba(0,0,0,.6); color: #fff; font-size: 11px; font-weight: 650;
+    letter-spacing: .06em; text-transform: uppercase;
+    padding: 3px 8px; border-radius: 4px;
   }
-  canvas {
-    display: block; border: 1px solid var(--line); border-radius: 4px;
-    background: rgba(128,128,128,0.08); touch-action: none; cursor: grab;
-  }
-  #c1 { cursor: crosshair; }
+  .stage { position: absolute; left: 0; top: 0; transform-origin: 0 0;
+           will-change: transform; }
+  .stage img { display: block; user-select: none; -webkit-user-drag: none; }
+  .stage svg { position: absolute; left: 0; top: 0; overflow: visible;
+               pointer-events: none; }
+
+  /* suggerimento */
+  #hint { min-height: 20px; font-size: 13px; opacity: .8; }
+  #hint b { font-weight: 650; }
 </style>
 </head>
 <body>
+<div id="app">
   <div id="bar">
-    <button id="zin">Zoom +</button>
-    <button id="zout">Zoom &minus;</button>
-    <button id="zfit">Adatta</button>
-    <span id="zoomval">100%</span>
-    <span id="hint">Rotella: zoom &nbsp;|&nbsp; Trascina: sposta &nbsp;|&nbsp; Click sulla vista destra: rimuove la chiazza &nbsp;|&nbsp; Doppio click: reset</span>
+    <div class="grp">
+      <span class="lbl">Strumento</span>
+      <div class="seg" id="modes">
+        <button data-mode="pan" class="on">Naviga</button>
+        <button data-mode="remove">Rimuovi chiazza</button>
+        <button data-mode="poly">Aggiungi zona</button>
+      </div>
+    </div>
+    <div class="grp" id="drawgrp" hidden>
+      <button class="solo" id="bClose">Chiudi zona</button>
+      <button class="solo" id="bUndoPt">Annulla vertice</button>
+      <button class="solo" id="bCancel">Annulla disegno</button>
+    </div>
+    <div class="spacer"></div>
+    <div class="grp">
+      <span class="lbl">Vista</span>
+      <div class="seg" id="views">
+        <button data-view="both" class="on">Affiancate</button>
+        <button data-view="orig">Originale</button>
+        <button data-view="ov">Rilevamento</button>
+      </div>
+    </div>
+    <div class="grp">
+      <span class="lbl">Zoom</span>
+      <div class="seg">
+        <button id="zout" title="Riduci">&minus;</button>
+        <button id="zfit">Adatta</button>
+        <button id="zin" title="Ingrandisci">+</button>
+      </div>
+      <span id="zlbl"></span>
+    </div>
   </div>
+
   <div id="panes">
-    <div><div class="label">Immagine originale</div><canvas id="c0"></canvas></div>
-    <div><div class="label">Chiazze rilevate</div><canvas id="c1"></canvas></div>
+    <div class="pane pan" id="paneA">
+      <div class="tag">Originale</div>
+      <div class="stage"><img draggable="false"><svg></svg></div>
+    </div>
+    <div class="pane pan" id="paneB">
+      <div class="tag">Rilevamento</div>
+      <div class="stage"><img draggable="false"><svg></svg></div>
+    </div>
   </div>
+
+  <div id="hint"></div>
+</div>
 
 <script>
-(function () {
-  const GAP = 16, BAR = 40, LABEL = 26, MAXH = 780, MAXZ = 40;
-  const $ = id => document.getElementById(id);
-  const c0 = $('c0'), c1 = $('c1');
-  const ctxs = [c0.getContext('2d'), c1.getContext('2d')];
-  const canv = [c0, c1];
+/* ---------- protocollo componente Streamlit (senza dipendenze) ---------- */
+function post(type, data) {
+  window.parent.postMessage(Object.assign({isStreamlitMessage: true, type}, data), "*");
+}
+const ST = {
+  ready:  () => post("streamlit:componentReady", {apiVersion: 1}),
+  height: h  => post("streamlit:setFrameHeight", {height: h}),
+  value:  v  => post("streamlit:setComponentValue", {value: v, dataType: "json"}),
+};
 
-  let imgs = [null, null];
-  let ids = { orig: null, ov: null };
-  let dims = { w: 0, h: 0 };
-  let view = { zoom: 1, cx: 0, cy: 0 };
-  let cw = 300, ch = 300, dpr = 1;
-  let hover = null, pending = null, lastFrameH = 0;
+/* ----------------------------- stato ----------------------------- */
+const S = {
+  W: 0, H: 0, s: 1, tx: 0, ty: 0, fitS: 1, fitted: true,
+  mode: "pan", view: "both",
+  pts: [], cursor: null, flash: null,
+  origId: null, ovId: null, height: 0,
+};
+const $ = id => document.getElementById(id);
+const panes = [$("paneA"), $("paneB")];
+const stages = panes.map(p => p.querySelector(".stage"));
+const imgs   = panes.map(p => p.querySelector("img"));
+const svgs   = panes.map(p => p.querySelector("svg"));
 
-  // ---------- protocollo Streamlit ----------
-  function post(type, extra) {
-    window.parent.postMessage(Object.assign(
-      { isStreamlitMessage: true, type: 'streamlit:' + type }, extra || {}), '*');
+/* ------------------------- render da Streamlit ------------------------- */
+window.addEventListener("message", e => {
+  if (!e.data || e.data.type !== "streamlit:render") return;
+  const a = e.data.args || {};
+  const t = e.data.theme;
+  if (t) {
+    const r = document.documentElement.style;
+    r.setProperty("--bg", t.backgroundColor);
+    r.setProperty("--fg", t.textColor);
+    r.setProperty("--sec", t.secondaryBackgroundColor);
+    r.setProperty("--primary", t.primaryColor);
   }
-  function setHeight(h) {
-    if (h !== lastFrameH) { lastFrameH = h; post('setFrameHeight', { height: h }); }
-  }
-  function sendValue(v) {
-    post('setComponentValue', { value: v, dataType: 'json' });
-  }
+  const h = a.height || 720;
+  if (h !== S.height) { S.height = h; ST.height(h); }
+  loadImage(0, a.original, a.original_id, "origId");
+  loadImage(1, a.overlay,  a.overlay_id,  "ovId");
+});
 
-  // ---------- geometria ----------
-  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
-  const fit = () => Math.min(cw / dims.w, ch / dims.h);
-  const scale = () => fit() * view.zoom;
-  function toImg(mx, my) {
-    const s = scale();
-    return { x: (mx - cw / 2) / s + view.cx, y: (my - ch / 2) / s + view.cy };
-  }
-  function clampView() {
-    view.zoom = clamp(view.zoom, 1, MAXZ);
-    if (view.zoom <= 1.0001) { view.cx = dims.w / 2; view.cy = dims.h / 2; return; }
-    view.cx = clamp(view.cx, 0, dims.w);
-    view.cy = clamp(view.cy, 0, dims.h);
-  }
-  function resetView() {
-    view = { zoom: 1, cx: dims.w / 2, cy: dims.h / 2 };
-    draw();
-  }
-
-  // ---------- disegno ----------
-  function drawPane(i) {
-    const ctx = ctxs[i], c = canv[i], img = imgs[i];
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.clearRect(0, 0, c.width, c.height);
-    if (!img || !dims.w) return;
-    const s = scale();
-    ctx.setTransform(dpr * s, 0, 0, dpr * s,
-                     dpr * (cw / 2 - view.cx * s), dpr * (ch / 2 - view.cy * s));
-    ctx.imageSmoothingEnabled = (s * dpr) < 3;
-    ctx.imageSmoothingQuality = 'high';
-    ctx.drawImage(img, 0, 0);
-
-    // elementi in coordinate schermo
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    const sx = p => (p.x - view.cx) * s + cw / 2;
-    const sy = p => (p.y - view.cy) * s + ch / 2;
-    if (hover) {
-      ctx.lineWidth = 1.5; ctx.strokeStyle = 'rgba(255,212,0,0.95)';
-      ctx.beginPath(); ctx.arc(sx(hover), sy(hover), 7, 0, 2 * Math.PI); ctx.stroke();
+function loadImage(i, url, id, flag) {
+  if (!url || S[flag] === id) return;
+  S[flag] = id;
+  const im = new Image();
+  im.onload = () => {
+    imgs[i].src = url;
+    if (im.naturalWidth !== S.W || im.naturalHeight !== S.H) {
+      S.W = im.naturalWidth; S.H = im.naturalHeight;
+      stages.forEach((st, k) => {
+        st.style.width = S.W + "px"; st.style.height = S.H + "px";
+        imgs[k].style.width = S.W + "px"; imgs[k].style.height = S.H + "px";
+        svgs[k].setAttribute("width", S.W);
+        svgs[k].setAttribute("height", S.H);
+        svgs[k].setAttribute("viewBox", `0 0 ${S.W} ${S.H}`);
+      });
+      S.pts = [];
+      S.fitted = true;
+      fit();
     }
-    if (pending && i === 1) {
-      ctx.lineWidth = 2; ctx.strokeStyle = 'rgba(0,200,255,0.95)';
-      ctx.beginPath(); ctx.arc(sx(pending), sy(pending), 10, 0, 2 * Math.PI); ctx.stroke();
-    }
-  }
-  function draw() {
-    drawPane(0); drawPane(1);
-    $('zoomval').textContent = Math.round(view.zoom * 100) + '%';
-  }
+  };
+  im.src = url;
+}
 
-  function layout() {
-    if (!dims.w) return;
-    dpr = window.devicePixelRatio || 1;
-    const total = document.documentElement.clientWidth;
-    cw = Math.floor((total - GAP) / 2) - 2;
-    ch = Math.max(240, Math.min(MAXH, Math.round(cw * dims.h / dims.w)));
-    for (const c of canv) {
-      c.style.width = cw + 'px'; c.style.height = ch + 'px';
-      c.width = Math.round(cw * dpr); c.height = Math.round(ch * dpr);
-    }
-    setHeight(BAR + LABEL + ch + 12);
-    clampView();
-    draw();
-  }
+/* --------------------------- trasformazione --------------------------- */
+function visiblePane() { return panes.find(p => !p.classList.contains("hide")); }
 
-  // ---------- interazione ----------
-  let drag = null;
-  function attach(c, isOv) {
-    c.addEventListener('pointerdown', e => {
-      if (e.button !== 0) return;
-      c.setPointerCapture(e.pointerId);
-      drag = { x: e.clientX, y: e.clientY, sx: e.clientX, sy: e.clientY, moved: false };
+function applyT() {
+  const t = `translate(${S.tx}px, ${S.ty}px) scale(${S.s})`;
+  stages.forEach(st => st.style.transform = t);
+  $("zlbl").textContent = Math.round(S.s * 100) + "%";
+  drawDraft();
+}
+
+function fit() {
+  const r = visiblePane().getBoundingClientRect();
+  if (!S.W || !r.width || !r.height) return;
+  S.fitS = Math.min(r.width / S.W, r.height / S.H);
+  S.s = S.fitS;
+  S.tx = (r.width - S.W * S.s) / 2;
+  S.ty = (r.height - S.H * S.s) / 2;
+  S.fitted = true;
+  applyT();
+}
+
+function zoomAt(mx, my, f) {
+  const ns = Math.min(Math.max(S.s * f, S.fitS * 0.6), 24);
+  const k = ns / S.s;
+  S.tx = mx - (mx - S.tx) * k;
+  S.ty = my - (my - S.ty) * k;
+  S.s = ns; S.fitted = false;
+  applyT();
+}
+
+new ResizeObserver(() => { if (S.fitted) fit(); else applyT(); })
+  .observe($("panes"));
+
+/* ------------------------------ disegno ------------------------------ */
+function drawDraft() {
+  let h = "";
+  const r = 5 / S.s;
+  if (S.pts.length) {
+    const p = S.pts.map(q => q[0] + "," + q[1]).join(" ");
+    const live = (S.cursor && S.mode === "poly") ? p + " " + S.cursor.join(",") : p;
+    if (S.pts.length >= 2)
+      h += `<polygon points="${p}" fill="rgba(255,176,0,.20)" stroke="none"/>`;
+    h += `<polyline points="${live}" fill="none" stroke="#ffb000" stroke-width="2"
+           stroke-linejoin="round" vector-effect="non-scaling-stroke"/>`;
+    S.pts.forEach((q, i) => {
+      h += `<circle cx="${q[0]}" cy="${q[1]}" r="${r}" fill="${i ? "#ffb000" : "#fff"}"
+             stroke="#000" stroke-width="1" vector-effect="non-scaling-stroke"/>`;
     });
-    c.addEventListener('pointermove', e => {
-      const r = c.getBoundingClientRect();
-      const mx = e.clientX - r.left, my = e.clientY - r.top;
-      if (drag) {
-        if (!drag.moved && Math.hypot(e.clientX - drag.sx, e.clientY - drag.sy) > 4) {
-          drag.moved = true; c.style.cursor = 'grabbing';
-        }
-        if (drag.moved) {
-          const s = scale();
-          view.cx -= (e.clientX - drag.x) / s;
-          view.cy -= (e.clientY - drag.y) / s;
-          clampView();
-        }
-        drag.x = e.clientX; drag.y = e.clientY;
+  }
+  if (S.flash) {
+    h += `<circle cx="${S.flash[0]}" cy="${S.flash[1]}" r="${12 / S.s}" fill="none"
+           stroke="#00e5ff" stroke-width="3" vector-effect="non-scaling-stroke"/>`;
+  }
+  svgs.forEach(s => s.innerHTML = h);
+}
+
+/* ------------------------------- UI ------------------------------- */
+const HINTS = {
+  pan:    "<b>Naviga</b> &middot; trascina per spostare, rotellina per zoom.",
+  remove: "<b>Rimuovi chiazza</b> &middot; clicca su una zona rossa per escluderla dal calcolo.",
+  poly:   () => S.pts.length
+    ? `<b>Aggiungi zona</b> &middot; ${S.pts.length} vertici &middot; clic sinistro: nuovo vertice &middot; ` +
+      `<b>clic destro</b> (o Invio): chiudi e aggiungi &middot; Esc: annulla`
+    : "<b>Aggiungi zona</b> &middot; clicca per segnare i vertici del contorno; " +
+      "<b>clic destro</b> per chiudere il poligono.",
+};
+
+function updateUI() {
+  document.querySelectorAll("#modes button").forEach(b =>
+    b.classList.toggle("on", b.dataset.mode === S.mode));
+  document.querySelectorAll("#views button").forEach(b =>
+    b.classList.toggle("on", b.dataset.view === S.view));
+  panes.forEach(p => { p.classList.remove("pan", "remove", "poly"); p.classList.add(S.mode); });
+  $("drawgrp").hidden = !(S.mode === "poly" && S.pts.length);
+  const hint = HINTS[S.mode];
+  $("hint").innerHTML = typeof hint === "function" ? hint() : hint;
+  drawDraft();
+}
+
+function setView(v) {
+  S.view = v;
+  panes[0].classList.toggle("hide", v === "ov");
+  panes[1].classList.toggle("hide", v === "orig");
+  updateUI();
+  requestAnimationFrame(() => { if (S.fitted) fit(); else applyT(); });
+}
+
+function setMode(m) {
+  if (m !== "poly") S.pts = [];
+  S.mode = m; S.cursor = null;
+  updateUI();
+}
+
+document.querySelectorAll("#modes button").forEach(b =>
+  b.addEventListener("click", () => setMode(b.dataset.mode)));
+document.querySelectorAll("#views button").forEach(b =>
+  b.addEventListener("click", () => setView(b.dataset.view)));
+$("zfit").addEventListener("click", fit);
+$("zin").addEventListener("click", () => {
+  const r = visiblePane().getBoundingClientRect();
+  zoomAt(r.width / 2, r.height / 2, 1.4);
+});
+$("zout").addEventListener("click", () => {
+  const r = visiblePane().getBoundingClientRect();
+  zoomAt(r.width / 2, r.height / 2, 1 / 1.4);
+});
+
+/* ------------------------ azioni verso Python ------------------------ */
+function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 7); }
+
+function closePoly() {
+  if (S.pts.length < 3) {
+    $("hint").innerHTML = "<b>Servono almeno 3 vertici</b> per chiudere una zona.";
+    return;
+  }
+  ST.value({
+    id: uid(), type: "poly",
+    pts: S.pts.map(q => [q[0] / S.W, q[1] / S.H]),
+  });
+  S.pts = []; S.cursor = null;
+  updateUI();
+}
+function undoPoint() { S.pts.pop(); updateUI(); }
+function cancelPoly() { S.pts = []; S.cursor = null; updateUI(); }
+$("bClose").addEventListener("click", closePoly);
+$("bUndoPt").addEventListener("click", undoPoint);
+$("bCancel").addEventListener("click", cancelPoly);
+
+window.addEventListener("keydown", e => {
+  if (S.mode !== "poly") return;
+  if (e.key === "Escape") cancelPoly();
+  else if (e.key === "Enter") closePoly();
+  else if (e.key === "Backspace" || e.key === "Delete" ||
+           ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z")) {
+    e.preventDefault(); undoPoint();
+  }
+});
+
+/* ---------------------------- puntatore ---------------------------- */
+function toImage(pane, e) {
+  const r = pane.getBoundingClientRect();
+  return [(e.clientX - r.left - S.tx) / S.s, (e.clientY - r.top - S.ty) / S.s];
+}
+const inside = p => p[0] >= 0 && p[1] >= 0 && p[0] <= S.W && p[1] <= S.H;
+
+let drag = null;
+panes.forEach(pane => {
+  pane.addEventListener("pointerdown", e => {
+    if (e.button !== 0 && e.button !== 1) return;
+    drag = {x: e.clientX, y: e.clientY, tx: S.tx, ty: S.ty,
+            moved: false, btn: e.button};
+    pane.setPointerCapture(e.pointerId);
+    window.focus();
+  });
+
+  pane.addEventListener("pointermove", e => {
+    if (drag) {
+      const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+      if (!drag.moved && Math.hypot(dx, dy) > 4) {
+        drag.moved = true; pane.classList.add("drag");
       }
-      hover = toImg(mx, my);
-      draw();
-    });
-    c.addEventListener('pointerup', e => {
-      if (drag && !drag.moved && isOv) {
-        const r = c.getBoundingClientRect();
-        const p = toImg(e.clientX - r.left, e.clientY - r.top);
-        if (p.x >= 0 && p.y >= 0 && p.x < dims.w && p.y < dims.h) {
-          pending = p; draw();
-          sendValue({
-            fx: p.x / dims.w, fy: p.y / dims.h,
-            id: Date.now() + '-' + Math.random().toString(36).slice(2, 8)
-          });
-        }
+      if (drag.moved) {
+        S.tx = drag.tx + dx; S.ty = drag.ty + dy; S.fitted = false;
+        applyT();
       }
-      drag = null;
-      c.style.cursor = isOv ? 'crosshair' : 'grab';
-    });
-    c.addEventListener('pointerleave', () => { if (!drag) { hover = null; draw(); } });
-    c.addEventListener('dblclick', resetView);
-    c.addEventListener('wheel', e => {
-      e.preventDefault();               // evita zoom/scroll della pagina
-      const r = c.getBoundingClientRect();
-      const mx = e.clientX - r.left, my = e.clientY - r.top;
-      const before = toImg(mx, my);
-      const dy = e.deltaMode === 1 ? e.deltaY * 33 : e.deltaY;
-      view.zoom = clamp(view.zoom * Math.exp(-dy * (e.ctrlKey ? 0.01 : 0.0016)), 1, MAXZ);
-      const s = scale();
-      view.cx = before.x - (mx - cw / 2) / s;
-      view.cy = before.y - (my - ch / 2) / s;
-      clampView();
-      draw();
-    }, { passive: false });
-  }
-  attach(c0, false);
-  attach(c1, true);
-
-  function zoomCenter(f) {
-    view.zoom = clamp(view.zoom * f, 1, MAXZ);
-    clampView(); draw();
-  }
-  $('zin').onclick = () => zoomCenter(1.5);
-  $('zout').onclick = () => zoomCenter(1 / 1.5);
-  $('zfit').onclick = resetView;
-  window.addEventListener('resize', layout);
-
-  // ---------- caricamento immagini ----------
-  function load(idx, src, done) {
-    const im = new Image();
-    im.onload = () => {
-      imgs[idx] = im;
-      if (idx === 0 || !dims.w) {
-        const changed = dims.w !== im.naturalWidth || dims.h !== im.naturalHeight;
-        dims = { w: im.naturalWidth, h: im.naturalHeight };
-        if (idx === 0 || changed) view = { zoom: 1, cx: dims.w / 2, cy: dims.h / 2 };
-      }
-      if (done) done();
-      layout();
-    };
-    im.src = src;
-  }
-
-  function applyTheme(t) {
-    if (!t) return;
-    const root = document.documentElement.style;
-    if (t.textColor) root.setProperty('--fg', t.textColor);
-  }
-
-  window.addEventListener('message', ev => {
-    const d = ev.data;
-    if (!d || d.type !== 'streamlit:render') return;
-    applyTheme(d.theme);
-    const a = d.args || {};
-    if (a.original_id !== ids.orig) {
-      ids.orig = a.original_id;
-      load(0, a.original);
-    }
-    if (a.overlay_id !== ids.ov) {
-      ids.ov = a.overlay_id;
-      load(1, a.overlay, () => { pending = null; });
+    } else if (S.mode === "poly" && S.pts.length) {
+      S.cursor = toImage(pane, e);
+      drawDraft();
     }
   });
 
-  post('componentReady', { apiVersion: 1 });
-  setHeight(500);
-})();
+  pane.addEventListener("pointerup", e => {
+    const d = drag; drag = null;
+    pane.classList.remove("drag");
+    if (!d || d.moved || d.btn !== 0) return;
+    const p = toImage(pane, e);
+    if (!inside(p)) return;
+    if (S.mode === "remove") {
+      S.flash = p; drawDraft();
+      setTimeout(() => { S.flash = null; drawDraft(); }, 700);
+      ST.value({id: uid(), type: "remove", fx: p[0] / S.W, fy: p[1] / S.H});
+    } else if (S.mode === "poly") {
+      S.pts.push([Math.round(p[0] * 10) / 10, Math.round(p[1] * 10) / 10]);
+      updateUI();
+    }
+  });
+
+  pane.addEventListener("pointerleave", () => {
+    if (!drag && S.cursor) { S.cursor = null; drawDraft(); }
+  });
+
+  pane.addEventListener("contextmenu", e => {
+    if (S.mode !== "poly") return;
+    e.preventDefault();
+    closePoly();
+  });
+
+  pane.addEventListener("wheel", e => {
+    e.preventDefault();
+    const r = pane.getBoundingClientRect();
+    zoomAt(e.clientX - r.left, e.clientY - r.top, e.deltaY < 0 ? 1.15 : 1 / 1.15);
+  }, {passive: false});
+});
+
+updateUI();
+ST.ready();
 </script>
 </body>
 </html>
