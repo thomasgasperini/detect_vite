@@ -243,7 +243,7 @@ _viewer = components.declare_component(
 
 STYLE = """
 <style>
-    .block-container { padding-top: 2rem; padding-bottom: 2.5rem; max-width: 1600px; }
+    .block-container { padding-top: 1.5rem; padding-bottom: 2.5rem; max-width: 1600px; }
 
     .app-header { border-bottom: 1px solid rgba(128,128,128,.35);
                   padding-bottom: .8rem; margin-bottom: 1.1rem; }
@@ -266,9 +266,6 @@ STYLE = """
     div[data-testid="stMetricLabel"] p { font-size: .76rem; font-weight: 600;
         letter-spacing: .04em; text-transform: uppercase; opacity: .7; }
     div[data-testid="stMetricValue"] { font-size: 1.7rem; font-weight: 650; }
-    .hero div[data-testid="stMetric"] { border-color: #ff4b4b;
-        background: rgba(255,75,75,.08); }
-    .hero div[data-testid="stMetricValue"] { font-size: 2.2rem; }
 
     button[data-baseweb="tab"] { font-weight: 600; padding-left: 1.1rem;
                                  padding-right: 1.1rem; }
@@ -346,17 +343,6 @@ def undo_last():
     if st.session_state.actions:
         st.session_state.actions.pop()
 
-
-# ------------------------------- intestazione ------------------------------
-st.markdown(
-    """
-    <div class="app-header">
-        <h1>Detect Vite</h1>
-        <p>Rilevamento e quantificazione della peronospora su foglia di vite</p>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
 
 # ------------------------------- sidebar -----------------------------------
 with st.sidebar:
@@ -487,11 +473,8 @@ cop = 100 * fung_px / leaf_px
 
 st.caption(f"File: {file.name}   |   Dimensioni: {W_img} × {H} px")
 
-c1, c2, c3 = st.columns([1.3, 1, 1])
-with c1:
-    st.markdown('<div class="hero">', unsafe_allow_html=True)
-    st.metric("Copertura della foglia", f"{cop:.2f} %")
-    st.markdown('</div>', unsafe_allow_html=True)
+c1, c2, c3 = st.columns(3)
+c1.metric("Copertura della foglia", f"{cop:.2f} %")
 c2.metric("Area interessata", f"{fmt(fung_px * k)} {unit}")
 c3.metric("Area foglia", f"{fmt(leaf_px * k)} {unit}")
 
